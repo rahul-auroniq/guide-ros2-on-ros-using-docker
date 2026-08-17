@@ -197,31 +197,74 @@ docker run -it --network host --name my_ros2_container my-ros2-ws
 
 Since your host runs ROS1, to exchange topics/services between the two, use **ros1_bridge**. Easiest path: run it in a *third* container that has both ROS1 and ROS2 installed, or install it on the host if you have ROS2 there too. The common pattern:
 
-### Option A — dedicated bridge image (recommended)
-Pull an image that has both ROS1 Noetic and ROS2 Humble, e.g. `ros:noetic-ros-base` won't have ROS2 — instead use a bridge-specific image like `osrf/ros:noetic-desktop-full` isn't sufficient either. The reliable approach:
+No single official image ships both distros, so build a small dual-install bridge image once and reuse it.
 
-1. Make sure `roscore` is running on the **host** (native ROS1).
-2. Run the bridge container with host networking so it can reach the host's `roscore`:
+### Step 1 — Dockerfile for a Noetic + Humble bridge image
+```dockerfile
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# --- Base tools + locale ---
+RUN apt-get update && apt-get install -y \
+    curl gnupg2 lsb-release software-properties-common locales \
+    && locale-gen en_US.UTF-8
+
+# --- Add ROS2 (Humble) apt source ---
+RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg
+RUN echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" \
+    > /etc/apt/sources.list.d/ros2.list
+
+# --- Add ROS1 (Noetic) apt source ---
+RUN echo "deb http://packages.ros.org/ros/ubuntu $(lsb_release -cs) main" \
+    > /etc/apt/sources.list.d/ros1.list
+RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros1-archive-keyring.gpg
+
+RUN apt-get update && apt-get install -y \
+    ros-humble-ros-base \
+    ros-humble-ros1-bridge \
+    python3-rosdep \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN echo "source /opt/ros/humble/setup.bash" >> /root/.bashrc
+
+CMD ["bash"]
+```
+> Note: `ros-humble-ros1-bridge` pulls in the Noetic message libraries it needs to translate against; you generally do **not** need a full separate Noetic install in this container, just the bridge package plus access to your host's `roscore` over the network.
+
+Build it:
+```bash
+docker build -t noetic-humble-bridge .
+```
+
+### Step 2 — Make sure `roscore` is running on the host
+```bash
+# on the host (native ROS1 Noetic)
+source /opt/ros/noetic/setup.bash
+roscore
+```
+
+### Step 3 — Run the bridge container
 ```bash
 docker run -it --rm \
   --network host \
   -e ROS_MASTER_URI=http://localhost:11311 \
-  ros:noetic-humble-bridge \
-  ros2 run ros1_bridge dynamic_bridge
+  noetic-humble-bridge \
+  bash -c "source /opt/ros/humble/setup.bash && ros2 run ros1_bridge dynamic_bridge --bridge-all-topics"
 ```
-(If a pre-built dual image isn't available, build one from a Dockerfile that installs both `ros-noetic-ros-base` and `ros-humble-ros-base` plus `ros1_bridge` — this is the standard "dual ROS" bridge image pattern used in industry.)
+- `--network host` lets the container reach the host's `roscore` at `localhost:11311`.
+- `--bridge-all-topics` auto-bridges any topic whose message type exists on both sides. Drop that flag and pass explicit topic/type args if you only want specific topics bridged.
 
-### Option B — build ros1_bridge yourself in the ROS2 container
-Only works if ROS1 is also reachable/installed where the bridge runs:
+### Verifying it works
 ```bash
-apt-get update && apt-get install -y ros-humble-ros1-bridge
-source /opt/ros/humble/setup.bash
-ros2 run ros1_bridge dynamic_bridge --bridge-all-topics
-```
+# host side (ROS1)
+rostopic list
 
-### Key requirement either way
-- `ROS_MASTER_URI` must point to your host's running `roscore` (usually `http://localhost:11311` since you're using `--network host`).
-- The bridge auto-detects topics with matching types on both sides and relays messages between them.
+# ROS2 container side
+ros2 topic list
+
+# publish on one side, echo on the other to confirm messages cross
+```
 
 ---
 
